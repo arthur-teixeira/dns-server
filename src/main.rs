@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 
-use std::{error::Error, fs::File, net::Ipv4Addr};
-use std::io::Read;
+use core::panic;
+use std::net::UdpSocket;
+use std::{error::Error, net::Ipv4Addr};
+
+type Result<T> = std::result::Result<T, &'static str>;
 
 const BUF_LEN: usize = 512;
 
@@ -55,7 +58,7 @@ pub struct BytePacketBuffer {
     pos: usize,
 }
 
-fn bounds_check(pos: usize) -> Result<(), &'static str> {
+fn bounds_check(pos: usize) -> Result<()> {
     if pos > BUF_LEN {
         Err("End of buffer")
     } else {
@@ -79,7 +82,7 @@ impl BytePacketBuffer {
         self.pos = pos
     }
 
-    fn read(&mut self) -> Result<u8, &'static str> {
+    fn read(&mut self) -> Result<u8> {
         bounds_check(self.pos)?;
 
         let res = self.buf[self.pos];
@@ -88,26 +91,26 @@ impl BytePacketBuffer {
         Ok(res)
     }
 
-    fn get(&self, pos: usize) -> Result<u8, &'static str> {
+    fn get(&self, pos: usize) -> Result<u8> {
         bounds_check(pos)?;
 
         Ok(self.buf[pos])
     }
 
-    fn get_range(&self, start: usize, len: usize) -> Result<&[u8], &'static str> {
+    fn get_range(&self, start: usize, len: usize) -> Result<&[u8]> {
         bounds_check(start + len)?;
         Ok(&self.buf[start..start + len])
     }
 
-    fn read_u16(&mut self) -> Result<u16, &'static str> {
+    fn read_u16(&mut self) -> Result<u16> {
         Ok(((self.read()? as u16) << 8) | (self.read()? as u16))
     }
 
-    fn read_u32(&mut self) -> Result<u32, &'static str> {
+    fn read_u32(&mut self) -> Result<u32> {
         Ok((self.read_u16()? as u32) << 16 | (self.read_u16()? as u32))
     }
 
-    fn read_qname(&mut self, outstr: &mut String) -> Result<(), &'static str> {
+    fn read_qname(&mut self, outstr: &mut String) -> Result<()> {
         let mut pos = self.pos;
         let mut jumped = false;
         let max_jumps = 5;
@@ -159,6 +162,49 @@ impl BytePacketBuffer {
 
         Ok(())
     }
+
+    fn write(&mut self, val: u8) -> Result<()> {
+        bounds_check(self.pos)?;
+
+        self.buf[self.pos] = val;
+        self.pos += 1;
+
+        Ok(())
+    }
+
+    fn write_u8(&mut self, val: u8) -> Result<()> {
+        self.write(val)
+    }
+
+    fn write_u16(&mut self, val: u16) -> Result<()> {
+        self.write((val >> 8) as u8)?;
+        self.write((val & 0xFF) as u8)?;
+
+        Ok(())
+    }
+
+    fn write_u32(&mut self, val: u32) -> Result<()> {
+        self.write_u16((val >> 16) as u16)?;
+        self.write_u16((val & 0xFF) as u16)?;
+
+        Ok(())
+    }
+
+    fn write_qname(&mut self, qname: &str) -> Result<()> {
+        for label in qname.split('.') {
+            let len = label.len();
+            if len > 0x3f {
+                return Err("Single label exceeds 63 characters");
+            }
+
+            self.write_u8(len as u8)?;
+            for b in label.as_bytes() {
+                self.write_u8(*b)?;
+            }
+        }
+
+        self.write_u8(0)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -207,7 +253,7 @@ impl DnsHeader {
         Self::default()
     }
 
-    pub fn read(&mut self, buffer: &mut BytePacketBuffer) -> Result<(), &'static str> {
+    pub fn read(&mut self, buffer: &mut BytePacketBuffer) -> Result<()> {
         self.id = buffer.read_u16()?;
         let flags = buffer.read_u16()?;
         let a = (flags >> 8) as u8;
@@ -229,6 +275,33 @@ impl DnsHeader {
 
         Ok(())
     }
+
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        buffer.write_u16(self.id)?;
+
+        buffer.write_u8(
+            (self.recursion_desired as u8)
+                | ((self.truncated_message as u8) << 1)
+                | ((self.authoritative_answer as u8) << 2)
+                | (self.opcode << 3)
+                | ((self.response as u8) << 7) as u8,
+        )?;
+
+        buffer.write_u8(
+            (self.response as u8)
+                | ((self.checking_disabled as u8) << 4)
+                | ((self.authed_data as u8) << 5)
+                | ((self.z as u8) << 6)
+                | ((self.recursion_available as u8) << 7),
+        )?;
+
+        buffer.write_u16(self.questions)?;
+        buffer.write_u16(self.answers)?;
+        buffer.write_u16(self.authoritative_entries)?;
+        buffer.write_u16(self.resource_entries)?;
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,10 +315,19 @@ impl DnsQuestion {
         Self { name, qtype }
     }
 
-    pub fn read(&mut self, buffer: &mut BytePacketBuffer) -> Result<(), &'static str> {
+    pub fn read(&mut self, buffer: &mut BytePacketBuffer) -> Result<()> {
         buffer.read_qname(&mut self.name)?;
         self.qtype = QueryType::from_num(buffer.read_u16()?);
         let _ = buffer.read_u16()?;
+
+        Ok(())
+    }
+
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        buffer.write_qname(&self.name)?;
+
+        buffer.write_u16(self.qtype.to_num())?;
+        buffer.write_u16(1)?;
 
         Ok(())
     }
@@ -267,7 +349,7 @@ pub enum DnsRecord {
 }
 
 impl DnsRecord {
-    pub fn read(buffer: &mut BytePacketBuffer) -> Result<Self, &'static str> {
+    pub fn read(buffer: &mut BytePacketBuffer) -> Result<Self> {
         let mut domain = String::new();
         buffer.read_qname(&mut domain)?;
 
@@ -301,6 +383,32 @@ impl DnsRecord {
             }
         }
     }
+
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<usize> {
+        let start_pos = buffer.pos;
+
+        match *self {
+            Self::A {
+                ref domain,
+                ref addr,
+                ttl,
+            } => {
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::A.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(ttl)?;
+                buffer.write_u16(4)?;
+
+                for oc in addr.octets() {
+                    buffer.write_u8(oc)?;
+                }
+            }
+
+            Self::UNKNOWN { .. } => println!("Skipping record: {:?}", self),
+        }
+
+        Ok(buffer.pos - start_pos)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -329,7 +437,7 @@ impl DnsPacket {
         Self::default()
     }
 
-    pub fn from_buffer(buffer: &mut BytePacketBuffer) -> Result<Self, &'static str> {
+    pub fn from_buffer(buffer: &mut BytePacketBuffer) -> Result<Self> {
         let mut result = Self::new();
         result.header.read(buffer)?;
 
@@ -356,20 +464,66 @@ impl DnsPacket {
 
         Ok(result)
     }
+
+    pub fn write(&mut self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        self.header.questions = self.questions.len() as u16;
+        self.header.answers = self.answers.len() as u16;
+        self.header.authoritative_entries = self.authorities.len() as u16;
+        self.header.resource_entries = self.resources.len() as u16;
+
+        self.header.write(buffer)?;
+
+        for question in &self.questions {
+            question.write(buffer)?;
+        }
+
+        for rec in &self.answers {
+            rec.write(buffer)?;
+        }
+
+        for rec in &self.authorities {
+            rec.write(buffer)?;
+        }
+
+        for rec in &self.resources {
+            rec.write(buffer)?;
+        }
+
+        Ok(())
+    }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let mut f = File::open("response_packet.txt")?;
-    let mut buffer = BytePacketBuffer::new();
-    f.read(&mut buffer.buf)?;
+fn main() -> std::result::Result<(), Box<dyn Error>> {
+    let qname = "google.com";
+    let qtype = QueryType::A;
 
-    let packet = DnsPacket::from_buffer(&mut buffer)?;
-    println!("{:#?}", packet.header);
+    let server = ("8.8.8.8", 53);
+    let sock = UdpSocket::bind(("0.0.0.0", 3000))?;
 
-    packet.questions.iter().for_each(|q| println!("{:#?}", q));
-    packet.answers.iter().for_each(|q| println!("{:#?}", q));
-    packet.authorities.iter().for_each(|q| println!("{:#?}", q));
-    packet.resources.iter().for_each(|q| println!("{:#?}", q));
+    let mut packet = DnsPacket::new();
+
+    packet.header.id = 6666;
+    packet.header.questions = 1;
+    packet.header.recursion_desired = true;
+    packet
+        .questions
+        .push(DnsQuestion::new(qname.to_string(), qtype));
+
+    let mut req_buf = BytePacketBuffer::new();
+    packet.write(&mut req_buf)?;
+
+    sock.send_to(&req_buf.buf[0..req_buf.pos], server)?;
+
+    let mut res_buf = BytePacketBuffer::new();
+    sock.recv_from(&mut res_buf.buf)?;
+
+    let res_packet = DnsPacket::from_buffer(&mut res_buf)?;
+    println!("{:#?}", res_packet.header);
+
+    res_packet.questions.iter().for_each(|q| println!("{:#?}", q));
+    res_packet.answers.iter().for_each(|q| println!("{:#?}", q));
+    res_packet.authorities.iter().for_each(|q| println!("{:#?}", q));
+    res_packet.resources.iter().for_each(|q| println!("{:#?}", q));
 
     Ok(())
 }
