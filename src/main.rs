@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use anyhow::{anyhow, Result};
-use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, ToSocketAddrs, UdpSocket};
 
 const BUF_LEN: usize = 512;
 
@@ -648,11 +648,44 @@ impl DnsPacket {
 
         Ok(())
     }
+
+    pub fn get_random_a(&self) -> Option<Ipv4Addr> {
+        self.answers.iter().find_map(|record| match record {
+            DnsRecord::A { addr, .. } => Some(*addr),
+            _ => None,
+        })
+    }
+
+    fn get_ns<'a>(&'a self, qname: &'a str) -> impl Iterator<Item = (&str, &str)> {
+        self.authorities
+            .iter()
+            .filter_map(|record| match record {
+                DnsRecord::NS { domain, host, .. } => Some((domain.as_str(), host.as_str())),
+                _ => None,
+            })
+            .filter(move |(domain, _)| qname.ends_with(*domain))
+    }
+
+    pub fn get_resolved_ns(&self, qname: &str) -> Option<Ipv4Addr> {
+        self.get_ns(qname)
+            .flat_map(|(_, host)| {
+                self.resources
+                    .iter()
+                    .filter_map(move |record| match record {
+                        DnsRecord::A { domain, addr, .. } if domain == host => Some(addr),
+                        _ => None,
+                    })
+            })
+            .map(|addr| *addr)
+            .next()
+    }
+
+    pub fn get_unresolved_ns<'a>(&'a self, qname: &'a str) -> Option<&'a str> {
+        self.get_ns(qname).map(|(_, host)| host).next()
+    }
 }
 
-fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
-    let server = ("8.8.8.8", 53);
-
+fn lookup(qname: &str, qtype: QueryType, server: impl ToSocketAddrs) -> Result<DnsPacket> {
     let sock = UdpSocket::bind(("0.0.0.0", 3000))?;
 
     let mut packet = DnsPacket::new();
@@ -675,6 +708,58 @@ fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
     DnsPacket::from_buffer(&mut res_buf)
 }
 
+fn recursive_lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
+    // *a.root-servers.net
+    let mut ns = "198.41.0.4".parse::<Ipv4Addr>().unwrap();
+
+    loop {
+        println!(
+            "Attempting lookup of {:?} {} with name server {}",
+            qtype, qname, ns
+        );
+
+        // let ns_copy = ns;
+
+        let server = (ns, 53);
+        let response = lookup(qname, qtype, server)?;
+        println!("Response: {:?}", response);
+
+        if !response.answers.is_empty() && response.header.rescode == ResultCode::NOERROR {
+            return Ok(response);
+        }
+
+        // If we get a NXDOMAIN reply, it means that the authoritative server is telling us the
+        // name does not exist.
+        if response.header.rescode == ResultCode::NXDOMAIN {
+            return Ok(response);
+        }
+
+        // If we find a new nameserver that has already been resolved by the last ns
+        if let Some(new_ns) = response.get_resolved_ns(qname) {
+            ns = new_ns;
+            continue;
+        }
+
+        // Otherwise, resolve the if of the NS record. If no NS records exist,
+        // Return what the last server sent us.
+        let new_ns_name = match response.get_unresolved_ns(qname) {
+            Some(x) => x,
+            None => return Ok(response),
+        };
+
+        // Starting another lookup sequence to try and find an appropriate name server IP addr
+        let recursive_response = recursive_lookup(&new_ns_name, QueryType::A)?;
+
+        // Pick a random ip from the result, and restart the loop. If no such record is available,
+        // return what the last server sent us
+        if let Some(new_ns) = recursive_response.get_random_a() {
+            ns = new_ns;
+        } else {
+            return Ok(response);
+        }
+    }
+}
+
 fn handle_query(socket: &UdpSocket) -> Result<()> {
     let mut req_buffer = BytePacketBuffer::new();
 
@@ -692,7 +777,7 @@ fn handle_query(socket: &UdpSocket) -> Result<()> {
         Some(question) => {
             println!("Received query: {:?}", question);
 
-            match lookup(&question.name, question.qtype) {
+            match recursive_lookup(&question.name, question.qtype) {
                 Ok(result) => {
                     packet.questions.push(question);
                     packet.header.rescode = result.header.rescode;
@@ -711,7 +796,7 @@ fn handle_query(socket: &UdpSocket) -> Result<()> {
                         println!("Reource: {:?}", rec);
                         packet.resources.push(rec);
                     }
-                },
+                }
                 Err(_) => {
                     packet.header.rescode = ResultCode::SERVFAIL;
                 }
@@ -738,7 +823,7 @@ fn main() -> Result<()> {
 
     loop {
         match handle_query(&socket) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => eprintln!("An error ocurred: {}", e),
         }
     }
