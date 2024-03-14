@@ -1,9 +1,7 @@
 #![allow(dead_code)]
 
-use std::net::{Ipv6Addr, UdpSocket};
-use std::{error::Error, net::Ipv4Addr};
-
-type Result<T> = std::result::Result<T, &'static str>;
+use anyhow::{anyhow, Result};
+use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
 
 const BUF_LEN: usize = 512;
 
@@ -71,7 +69,7 @@ pub struct BytePacketBuffer {
 
 fn bounds_check(pos: usize) -> Result<()> {
     if pos > BUF_LEN {
-        Err("End of buffer")
+        Err(anyhow!("End of buffer"))
     } else {
         Ok(())
     }
@@ -130,7 +128,7 @@ impl BytePacketBuffer {
         let mut delim = "";
         loop {
             if jumps_performed > max_jumps {
-                return Err("Limit of 5 jumps exceeded");
+                return Err(anyhow!("Limit of 5 jumps exceeded"));
             }
 
             let len = self.get(pos)?;
@@ -205,7 +203,7 @@ impl BytePacketBuffer {
         for label in qname.split('.') {
             let len = label.len();
             if len > 0x3f {
-                return Err("Single label exceeds 63 characters");
+                return Err(anyhow!("Single labal exceeds 63 characters"));
             }
 
             self.write_u8(len as u8)?;
@@ -652,11 +650,9 @@ impl DnsPacket {
     }
 }
 
-fn main() -> std::result::Result<(), Box<dyn Error>> {
-    let qname = "www.yahoo.com";
-    let qtype = QueryType::MX;
-
+fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
     let server = ("8.8.8.8", 53);
+
     let sock = UdpSocket::bind(("0.0.0.0", 3000))?;
 
     let mut packet = DnsPacket::new();
@@ -676,24 +672,74 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     let mut res_buf = BytePacketBuffer::new();
     sock.recv_from(&mut res_buf.buf)?;
 
-    let res_packet = DnsPacket::from_buffer(&mut res_buf)?;
-    println!("{:#?}", res_packet.header);
+    DnsPacket::from_buffer(&mut res_buf)
+}
 
-    res_packet
-        .questions
-        .iter()
-        .for_each(|q| println!("{:#?}", q));
+fn handle_query(socket: &UdpSocket) -> Result<()> {
+    let mut req_buffer = BytePacketBuffer::new();
 
-    res_packet.answers.iter().for_each(|q| println!("{:#?}", q));
+    let (_, src) = socket.recv_from(&mut req_buffer.buf)?;
 
-    res_packet
-        .authorities
-        .iter()
-        .for_each(|q| println!("{:#?}", q));
-    res_packet
-        .resources
-        .iter()
-        .for_each(|q| println!("{:#?}", q));
+    let mut request = DnsPacket::from_buffer(&mut req_buffer)?;
+
+    let mut packet = DnsPacket::new();
+    packet.header.id = request.header.id;
+    packet.header.recursion_desired = true;
+    packet.header.recursion_available = true;
+    packet.header.response = true;
+
+    match request.questions.pop() {
+        Some(question) => {
+            println!("Received query: {:?}", question);
+
+            match lookup(&question.name, question.qtype) {
+                Ok(result) => {
+                    packet.questions.push(question);
+                    packet.header.rescode = result.header.rescode;
+
+                    for rec in result.answers {
+                        println!("Answer: {:?}", rec);
+                        packet.answers.push(rec);
+                    }
+
+                    for rec in result.authorities {
+                        println!("Authority: {:?}", rec);
+                        packet.authorities.push(rec)
+                    }
+
+                    for rec in result.resources {
+                        println!("Reource: {:?}", rec);
+                        packet.resources.push(rec);
+                    }
+                },
+                Err(_) => {
+                    packet.header.rescode = ResultCode::SERVFAIL;
+                }
+            }
+        }
+        None => {
+            packet.header.rescode = ResultCode::FORMERR;
+        }
+    }
+
+    let mut res_buffer = BytePacketBuffer::new();
+    packet.write(&mut res_buffer)?;
+
+    let len = res_buffer.pos;
+    let data = res_buffer.get_range(0, len)?;
+
+    socket.send_to(data, src)?;
 
     Ok(())
+}
+
+fn main() -> Result<()> {
+    let socket = UdpSocket::bind(("0.0.0.0", 2053))?;
+
+    loop {
+        match handle_query(&socket) {
+            Ok(_) => {},
+            Err(e) => eprintln!("An error ocurred: {}", e),
+        }
+    }
 }
