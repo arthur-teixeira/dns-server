@@ -3,7 +3,9 @@
 use anyhow::{anyhow, Result};
 use std::net::{Ipv4Addr, Ipv6Addr, ToSocketAddrs, UdpSocket};
 
-const BUF_LEN: usize = 512;
+const BUF_LEN: usize = 1024; // TODO: This is wrong, the max size for a packet over UDP (without EDNS) is 512, if
+                             // the answer is bigger than that, the server should truncate it to
+                             // trigger a retry over TCP. Another option is to implement EDNS(0)
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ResultCode {
@@ -68,7 +70,7 @@ pub struct BytePacketBuffer {
 }
 
 fn bounds_check(pos: usize) -> Result<()> {
-    if pos > BUF_LEN {
+    if pos >= BUF_LEN {
         Err(anyhow!("End of buffer"))
     } else {
         Ok(())
@@ -294,9 +296,10 @@ impl DnsHeader {
         Ok(())
     }
 
-    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<()> {
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<usize> {
         buffer.write_u16(self.id)?;
 
+        let initial_pos = buffer.pos;
         buffer.write_u8(
             (self.recursion_desired as u8)
                 | ((self.truncated_message as u8) << 1)
@@ -318,7 +321,7 @@ impl DnsHeader {
         buffer.write_u16(self.authoritative_entries)?;
         buffer.write_u16(self.resource_entries)?;
 
-        Ok(())
+        Ok(initial_pos)
     }
 }
 
@@ -628,7 +631,7 @@ impl DnsPacket {
         self.header.authoritative_entries = self.authorities.len() as u16;
         self.header.resource_entries = self.resources.len() as u16;
 
-        self.header.write(buffer)?;
+        let header_pos = self.header.write(buffer)?;
 
         for question in &self.questions {
             question.write(buffer)?;
@@ -644,6 +647,13 @@ impl DnsPacket {
 
         for rec in &self.resources {
             rec.write(buffer)?;
+        }
+
+        self.header.truncated_message = buffer.pos > 512;
+        if self.header.truncated_message {
+            let mut old_header = buffer.get(header_pos)?;
+            old_header |= (self.header.truncated_message as u8) << 1;
+            buffer.set(header_pos, old_header);
         }
 
         Ok(())
@@ -683,6 +693,23 @@ impl DnsPacket {
     pub fn get_unresolved_ns<'a>(&'a self, qname: &'a str) -> Option<&'a str> {
         self.get_ns(qname).map(|(_, host)| host).next()
     }
+
+    pub fn get_cname(&self) -> Option<&str> {
+        self.answers.iter().find_map(|record| match record {
+            DnsRecord::CNAME { host, .. } => Some(host.as_str()),
+            _ => None,
+        })
+    }
+
+    pub fn final_answers(&self) -> Vec<&DnsRecord> {
+        self.answers
+            .iter()
+            .filter(|ans| match ans {
+                DnsRecord::A { .. } => true,
+                _ => false,
+            })
+            .collect()
+    }
 }
 
 fn lookup(qname: &str, qtype: QueryType, server: impl ToSocketAddrs) -> Result<DnsPacket> {
@@ -718,14 +745,15 @@ fn recursive_lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
             qtype, qname, ns
         );
 
-        // let ns_copy = ns;
-
         let server = (ns, 53);
         let response = lookup(qname, qtype, server)?;
-        println!("Response: {:?}", response);
 
-        if !response.answers.is_empty() && response.header.rescode == ResultCode::NOERROR {
+        if !response.final_answers().is_empty() && response.header.rescode == ResultCode::NOERROR {
             return Ok(response);
+        }
+
+        if let Some(cname) = response.get_cname() {
+            return recursive_lookup(cname, QueryType::A);
         }
 
         // If we get a NXDOMAIN reply, it means that the authoritative server is telling us the
@@ -740,8 +768,8 @@ fn recursive_lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
             continue;
         }
 
-        // Otherwise, resolve the if of the NS record. If no NS records exist,
-        // Return what the last server sent us.
+        // Otherwise, resolve the ip of the NS record. If we don't find any,
+        // return what the last server sent us
         let new_ns_name = match response.get_unresolved_ns(qname) {
             Some(x) => x,
             None => return Ok(response),
@@ -789,11 +817,11 @@ fn handle_query(socket: &UdpSocket) -> Result<()> {
 
                     for rec in result.authorities {
                         println!("Authority: {:?}", rec);
-                        packet.authorities.push(rec)
+                        packet.authorities.push(rec);
                     }
 
                     for rec in result.resources {
-                        println!("Reource: {:?}", rec);
+                        println!("Resource: {:?}", rec);
                         packet.resources.push(rec);
                     }
                 }
