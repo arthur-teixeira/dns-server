@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Result};
 use std::net::{Ipv4Addr, Ipv6Addr, ToSocketAddrs, UdpSocket};
 
-const BUF_LEN: usize = 1024; // TODO: This is wrong, the max size for a packet over UDP (without EDNS) is 512, if
+const BUF_LEN: usize = 2048; // TODO: This is wrong, the max size for a packet over UDP (without EDNS) is 512, if
                              // the answer is bigger than that, the server should truncate it to
                              // trigger a retry over TCP. Another option is to implement EDNS(0)
 
@@ -65,22 +65,15 @@ impl QueryType {
 }
 
 pub struct BytePacketBuffer {
-    buf: [u8; BUF_LEN],
+    buf: Vec<u8>, // TODO: change write methods to push to buf instead of setting buf[pos]
+                  // directly. Remove "pos"
     pos: usize,
-}
-
-fn bounds_check(pos: usize) -> Result<()> {
-    if pos >= BUF_LEN {
-        Err(anyhow!("End of buffer"))
-    } else {
-        Ok(())
-    }
 }
 
 impl BytePacketBuffer {
     fn new() -> Self {
         BytePacketBuffer {
-            buf: [0; BUF_LEN],
+            buf: vec![0; BUF_LEN],
             pos: 0,
         }
     }
@@ -94,8 +87,6 @@ impl BytePacketBuffer {
     }
 
     fn read(&mut self) -> Result<u8> {
-        bounds_check(self.pos)?;
-
         let res = self.buf[self.pos];
         self.pos += 1;
 
@@ -103,13 +94,11 @@ impl BytePacketBuffer {
     }
 
     fn get(&self, pos: usize) -> Result<u8> {
-        bounds_check(pos)?;
 
         Ok(self.buf[pos])
     }
 
     fn get_range(&self, start: usize, len: usize) -> Result<&[u8]> {
-        bounds_check(start + len)?;
         Ok(&self.buf[start..start + len])
     }
 
@@ -175,8 +164,6 @@ impl BytePacketBuffer {
     }
 
     fn write(&mut self, val: u8) -> Result<()> {
-        bounds_check(self.pos)?;
-
         self.buf[self.pos] = val;
         self.pos += 1;
 
@@ -694,9 +681,13 @@ impl DnsPacket {
         self.get_ns(qname).map(|(_, host)| host).next()
     }
 
-    pub fn get_cname(&self) -> Option<&str> {
+    pub fn get_cname<'a>(&'a self) -> Option<DnsRecord> {
         self.answers.iter().find_map(|record| match record {
-            DnsRecord::CNAME { host, .. } => Some(host.as_str()),
+            DnsRecord::CNAME { host, domain, ttl } => Some(DnsRecord::CNAME {
+                domain: domain.clone(),
+                host: host.clone(),
+                ttl: *ttl,
+            }),
             _ => None,
         })
     }
@@ -709,6 +700,11 @@ impl DnsPacket {
                 _ => false,
             })
             .collect()
+    }
+
+    pub fn merge(&mut self, response: Self) {
+        self.answers.extend(response.answers);
+        self.header.rescode = response.header.rescode;
     }
 }
 
@@ -735,7 +731,11 @@ fn lookup(qname: &str, qtype: QueryType, server: impl ToSocketAddrs) -> Result<D
     DnsPacket::from_buffer(&mut res_buf)
 }
 
-fn recursive_lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
+fn recursive_lookup(
+    qname: &str,
+    qtype: QueryType,
+    accumulated_response: &mut DnsPacket,
+) -> Result<()> {
     // *a.root-servers.net
     let mut ns = "198.41.0.4".parse::<Ipv4Addr>().unwrap();
 
@@ -749,17 +749,25 @@ fn recursive_lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
         let response = lookup(qname, qtype, server)?;
 
         if !response.final_answers().is_empty() && response.header.rescode == ResultCode::NOERROR {
-            return Ok(response);
+            accumulated_response.merge(response);
+            return Ok(());
         }
 
         if let Some(cname) = response.get_cname() {
-            return recursive_lookup(cname, QueryType::A);
+            let host = match &cname {
+                DnsRecord::CNAME { host, .. } => host.clone(),
+                _ => unreachable!(),
+            };
+
+            accumulated_response.merge(response);
+            return recursive_lookup(host.as_str(), QueryType::A, accumulated_response);
         }
 
         // If we get a NXDOMAIN reply, it means that the authoritative server is telling us the
         // name does not exist.
         if response.header.rescode == ResultCode::NXDOMAIN {
-            return Ok(response);
+            accumulated_response.merge(response);
+            return Ok(());
         }
 
         // If we find a new nameserver that has already been resolved by the last ns
@@ -772,18 +780,23 @@ fn recursive_lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
         // return what the last server sent us
         let new_ns_name = match response.get_unresolved_ns(qname) {
             Some(x) => x,
-            None => return Ok(response),
+            None => {
+                accumulated_response.merge(response);
+                return Ok(());
+            }
         };
 
         // Starting another lookup sequence to try and find an appropriate name server IP addr
-        let recursive_response = recursive_lookup(&new_ns_name, QueryType::A)?;
+        let mut recursive_response = DnsPacket::new();
+        recursive_lookup(&new_ns_name, QueryType::A, &mut recursive_response)?;
 
         // Pick a random ip from the result, and restart the loop. If no such record is available,
         // return what the last server sent us
         if let Some(new_ns) = recursive_response.get_random_a() {
             ns = new_ns;
         } else {
-            return Ok(response);
+            accumulated_response.merge(recursive_response);
+            return Ok(());
         }
     }
 }
@@ -805,24 +818,21 @@ fn handle_query(socket: &UdpSocket) -> Result<()> {
         Some(question) => {
             println!("Received query: {:?}", question);
 
-            match recursive_lookup(&question.name, question.qtype) {
-                Ok(result) => {
+            match recursive_lookup(&question.name, question.qtype, &mut packet) {
+                Ok(_) => {
                     packet.questions.push(question);
-                    packet.header.rescode = result.header.rescode;
+                    // packet.header.rescode = result.header.rescode;
 
-                    for rec in result.answers {
+                    for rec in &packet.answers {
                         println!("Answer: {:?}", rec);
-                        packet.answers.push(rec);
                     }
 
-                    for rec in result.authorities {
+                    for rec in &packet.authorities {
                         println!("Authority: {:?}", rec);
-                        packet.authorities.push(rec);
                     }
 
-                    for rec in result.resources {
+                    for rec in &packet.resources {
                         println!("Resource: {:?}", rec);
-                        packet.resources.push(rec);
                     }
                 }
                 Err(_) => {
