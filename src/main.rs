@@ -1,11 +1,15 @@
-#![allow(dead_code)]
-
 use anyhow::{anyhow, Result};
-use std::net::{Ipv4Addr, Ipv6Addr, ToSocketAddrs, UdpSocket};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::sync::{Arc, RwLock};
+use std::thread;
+use std::time::Duration;
+use ttl_cache::{Entry, TtlCache};
 
-const BUF_LEN: usize = 2048; // TODO: This is wrong, the max size for a packet over UDP (without EDNS) is 512, if
-                             // the answer is bigger than that, the server should truncate it to
-                             // trigger a retry over TCP. Another option is to implement EDNS(0)
+const BUF_LEN: usize = 2048; // TODO: Implement EDNS(0)
+
+type DnsCache = TtlCache<String, DnsRecord>;
+type SharedDnsCache = Arc<RwLock<DnsCache>>;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ResultCode {
@@ -66,7 +70,7 @@ impl QueryType {
 
 pub struct BytePacketBuffer {
     buf: Vec<u8>, // TODO: change write methods to push to buf instead of setting buf[pos]
-                  // directly. Remove "pos"
+    // directly. Remove "pos"
     pos: usize,
 }
 
@@ -94,7 +98,6 @@ impl BytePacketBuffer {
     }
 
     fn get(&self, pos: usize) -> Result<u8> {
-
         Ok(self.buf[pos])
     }
 
@@ -192,7 +195,7 @@ impl BytePacketBuffer {
         for label in qname.split('.') {
             let len = label.len();
             if len > 0x3f {
-                return Err(anyhow!("Single labal exceeds 63 characters"));
+                return Err(anyhow!("Single label exceeds 63 characters"));
             }
 
             self.write_u8(len as u8)?;
@@ -556,6 +559,28 @@ impl DnsRecord {
 
         Ok(buffer.pos - start_pos)
     }
+
+    pub fn domain(&self) -> String {
+        match self {
+            Self::A { domain, .. } => domain,
+            Self::AAAA { domain, .. } => domain,
+            Self::NS { domain, .. } => domain,
+            Self::CNAME { domain, .. } => domain,
+            Self::MX { domain, .. } => domain,
+            Self::UNKNOWN { domain, .. } => domain,
+        }.clone()
+    }
+
+    pub fn ttl(&self) -> u32 {
+        match self {
+            Self::A { ttl, .. } => *ttl,
+            Self::AAAA { ttl, .. } => *ttl,
+            Self::NS { ttl, .. } => *ttl,
+            Self::CNAME { ttl, .. } => *ttl,
+            Self::MX { ttl, .. } => *ttl,
+            Self::UNKNOWN { ttl, .. } => *ttl,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -612,7 +637,7 @@ impl DnsPacket {
         Ok(result)
     }
 
-    pub fn write(&mut self, buffer: &mut BytePacketBuffer) -> Result<()> {
+    pub fn write(&mut self, buffer: &mut BytePacketBuffer, is_udp: bool) -> Result<()> {
         self.header.questions = self.questions.len() as u16;
         self.header.answers = self.answers.len() as u16;
         self.header.authoritative_entries = self.authorities.len() as u16;
@@ -637,7 +662,7 @@ impl DnsPacket {
         }
 
         self.header.truncated_message = buffer.pos > 512;
-        if self.header.truncated_message {
+        if self.header.truncated_message && is_udp {
             let mut old_header = buffer.get(header_pos)?;
             old_header |= (self.header.truncated_message as u8) << 1;
             buffer.set(header_pos, old_header);
@@ -708,9 +733,13 @@ impl DnsPacket {
     }
 }
 
-fn lookup(qname: &str, qtype: QueryType, server: impl ToSocketAddrs) -> Result<DnsPacket> {
-    let sock = UdpSocket::bind(("0.0.0.0", 3000))?;
-
+fn lookup(
+    qname: &str,
+    qtype: QueryType,
+    server: impl ToSocketAddrs,
+    is_udp: bool,
+    cache: &SharedDnsCache,
+) -> Result<DnsPacket> {
     let mut packet = DnsPacket::new();
 
     packet.header.id = 6666;
@@ -720,33 +749,45 @@ fn lookup(qname: &str, qtype: QueryType, server: impl ToSocketAddrs) -> Result<D
         .questions
         .push(DnsQuestion::new(qname.to_string(), qtype));
 
-    let mut req_buf = BytePacketBuffer::new();
-    packet.write(&mut req_buf)?;
+    if let Some(cached) = cache.read().unwrap().get(qname) {
+        packet.answers.push(cached.clone()); // TODO: calculate remaining TTL
+        return Ok(packet);
+    }
 
+    let mut req_buf = BytePacketBuffer::new();
+
+    packet.write(&mut req_buf, is_udp)?;
+    let sock = UdpSocket::bind(("0.0.0.0", 3000))?;
     sock.send_to(&req_buf.buf[0..req_buf.pos], server)?;
 
     let mut res_buf = BytePacketBuffer::new();
     sock.recv_from(&mut res_buf.buf)?;
 
-    DnsPacket::from_buffer(&mut res_buf)
+    let packet = DnsPacket::from_buffer(&mut res_buf)?;
+
+    packet.answers.iter().for_each(|ans| {
+        cache
+            .write()
+            .unwrap()
+            .insert(ans.domain(), ans.clone(), Duration::from_secs(ans.ttl() as u64));
+    });
+
+    Ok(packet)
 }
 
 fn recursive_lookup(
     qname: &str,
     qtype: QueryType,
+    is_udp: bool,
     accumulated_response: &mut DnsPacket,
+    cache: &SharedDnsCache,
 ) -> Result<()> {
     // *a.root-servers.net
     let mut ns = "198.41.0.4".parse::<Ipv4Addr>().unwrap();
 
     loop {
-        println!(
-            "Attempting lookup of {:?} {} with name server {}",
-            qtype, qname, ns
-        );
-
         let server = (ns, 53);
-        let response = lookup(qname, qtype, server)?;
+        let response = lookup(qname, qtype, server, is_udp, cache)?;
 
         if !response.final_answers().is_empty() && response.header.rescode == ResultCode::NOERROR {
             accumulated_response.merge(response);
@@ -754,13 +795,23 @@ fn recursive_lookup(
         }
 
         if let Some(cname) = response.get_cname() {
-            let host = match &cname {
-                DnsRecord::CNAME { host, .. } => host.clone(),
+            let host = match cname {
+                DnsRecord::CNAME { host, .. } => host,
                 _ => unreachable!(),
             };
 
+            if qtype == QueryType::CNAME {
+                return Ok(());
+            }
+
             accumulated_response.merge(response);
-            return recursive_lookup(host.as_str(), QueryType::A, accumulated_response);
+            return recursive_lookup(
+                host.as_str(),
+                QueryType::A,
+                is_udp,
+                accumulated_response,
+                cache,
+            );
         }
 
         // If we get a NXDOMAIN reply, it means that the authoritative server is telling us the
@@ -788,7 +839,13 @@ fn recursive_lookup(
 
         // Starting another lookup sequence to try and find an appropriate name server IP addr
         let mut recursive_response = DnsPacket::new();
-        recursive_lookup(&new_ns_name, QueryType::A, &mut recursive_response)?;
+        recursive_lookup(
+            &new_ns_name,
+            QueryType::A,
+            is_udp,
+            &mut recursive_response,
+            cache,
+        )?;
 
         // Pick a random ip from the result, and restart the loop. If no such record is available,
         // return what the last server sent us
@@ -801,12 +858,12 @@ fn recursive_lookup(
     }
 }
 
-fn handle_query(socket: &UdpSocket) -> Result<()> {
-    let mut req_buffer = BytePacketBuffer::new();
-
-    let (_, src) = socket.recv_from(&mut req_buffer.buf)?;
-
-    let mut request = DnsPacket::from_buffer(&mut req_buffer)?;
+fn handle_query(
+    req_buffer: &mut BytePacketBuffer,
+    is_udp: bool,
+    cache: &SharedDnsCache,
+) -> Result<BytePacketBuffer> {
+    let mut request = DnsPacket::from_buffer(req_buffer)?;
 
     let mut packet = DnsPacket::new();
     packet.header.id = request.header.id;
@@ -818,22 +875,9 @@ fn handle_query(socket: &UdpSocket) -> Result<()> {
         Some(question) => {
             println!("Received query: {:?}", question);
 
-            match recursive_lookup(&question.name, question.qtype, &mut packet) {
+            match recursive_lookup(&question.name, question.qtype, is_udp, &mut packet, &cache) {
                 Ok(_) => {
                     packet.questions.push(question);
-                    // packet.header.rescode = result.header.rescode;
-
-                    for rec in &packet.answers {
-                        println!("Answer: {:?}", rec);
-                    }
-
-                    for rec in &packet.authorities {
-                        println!("Authority: {:?}", rec);
-                    }
-
-                    for rec in &packet.resources {
-                        println!("Resource: {:?}", rec);
-                    }
                 }
                 Err(_) => {
                     packet.header.rescode = ResultCode::SERVFAIL;
@@ -846,23 +890,63 @@ fn handle_query(socket: &UdpSocket) -> Result<()> {
     }
 
     let mut res_buffer = BytePacketBuffer::new();
-    packet.write(&mut res_buffer)?;
+    packet.write(&mut res_buffer, is_udp)?;
 
+    Ok(res_buffer)
+}
+
+fn handle_tcp_query(stream: &mut TcpStream, cache: &SharedDnsCache) -> Result<()> {
+    let mut req_buffer = BytePacketBuffer::new();
+    let mut req_size_buf = [0u8; 2];
+    stream.read_exact(&mut req_size_buf)?;
+    stream.read(&mut req_buffer.buf)?;
+
+    let res_buffer = handle_query(&mut req_buffer, false, cache)?;
     let len = res_buffer.pos;
-    let data = res_buffer.get_range(0, len)?;
 
-    socket.send_to(data, src)?;
+    stream.write(&[(len >> 8) as u8, (len & 0xFF) as u8])?;
+    stream.write(&res_buffer.buf[0..len])?;
+    stream.flush()?;
+
+    Ok(())
+}
+
+fn handle_udp_query(socket: &UdpSocket, cache: &SharedDnsCache) -> Result<()> {
+    let mut req_buffer = BytePacketBuffer::new();
+
+    let (_, src) = socket.recv_from(&mut req_buffer.buf)?;
+
+    let res_buffer = handle_query(&mut req_buffer, true, cache)?;
+    let len = res_buffer.pos;
+
+    socket.send_to(&res_buffer.buf[0..len], src)?;
 
     Ok(())
 }
 
 fn main() -> Result<()> {
     let socket = UdpSocket::bind(("0.0.0.0", 2053))?;
+    let tcp_socket = TcpListener::bind(("0.0.0.0", 2053))?;
 
-    loop {
-        match handle_query(&socket) {
+    let cache = Arc::new(RwLock::new(DnsCache::new(1000)));
+
+    let udp_cache = cache.clone();
+    thread::spawn(move || loop {
+        match handle_udp_query(&socket, &udp_cache) {
             Ok(_) => {}
             Err(e) => eprintln!("An error ocurred: {}", e),
         }
+    });
+
+    for stream in tcp_socket.incoming() {
+        let cache = cache.clone();
+        match stream {
+            Ok(mut stream) => {
+                thread::spawn(move || handle_tcp_query(&mut stream, &cache));
+            }
+            Err(e) => eprintln!("An error ocurred: {}", e),
+        }
     }
+
+    Ok(())
 }
